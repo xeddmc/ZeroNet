@@ -1,6 +1,7 @@
 '''
 Based on the specification at http://bittorrent.org/beps/bep_0015.html
 '''
+import binascii
 import random
 import struct
 import time
@@ -43,7 +44,7 @@ class UdpTrackerClient:
         self.conn_id = 0x41727101980
         self.transactions = {}
         self.peer_id = self._generate_peer_id()
-        self.timeout = 2
+        self.timeout = 9
 
     def connect(self):
         return self._send(CONNECT)
@@ -111,7 +112,7 @@ class UdpTrackerClient:
         return trans
 
     def error(self, message):
-        print('error: {}'.format(message))
+        raise Exception('error: {}'.format(message))
 
     def _send(self, action, payload=None):
         if not payload:
@@ -123,7 +124,8 @@ class UdpTrackerClient:
             'payload': payload,
             'completed': False,
         }
-        self.sock.sendto(header + payload, (self.host, self.port))
+        self.sock.connect((self.host, self.port))
+        self.sock.send(header + payload)
         return trans
 
     def _request_header(self, action):
@@ -138,7 +140,7 @@ class UdpTrackerClient:
         elif action == SCRAPE:
             return self._process_scrape(payload, trans)
         elif action == ERROR:
-            return self._proecss_error(payload, trans)
+            return self._process_error(payload, trans)
         else:
             raise UdpTrackerClientException(
                 'Unknown action response: {}'.format(action))
@@ -200,7 +202,7 @@ class UdpTrackerClient:
         it here for the possibility.
         '''
         self.error(payload)
-        return payload
+        return False
 
     def _generate_peer_id(self):
         '''http://www.bittorrent.org/beps/bep_0020.html'''

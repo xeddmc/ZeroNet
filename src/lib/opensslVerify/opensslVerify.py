@@ -14,6 +14,8 @@ import base64
 import time
 import logging
 import sys
+import os
+
 addrtype = 0
 
 
@@ -190,18 +192,17 @@ class _OpenSSL:
 
 ssl = None
 
-
 def openLibrary():
     global ssl
-    try:
-        if sys.platform.startswith("win"):
-            ssl = _OpenSSL("src/lib/opensslVerify/libeay32.dll")
-        else:  # Try to use self-compiled first
-            ssl = _OpenSSL("/usr/local/ssl/lib/libcrypto.so")
-    except:
-        ssl = _OpenSSL(ctypes.util.find_library('ssl') or ctypes.util.find_library('crypto') or 'libeay32')
+    import util.SslPatch
+    ssl = _OpenSSL(util.SslPatch.getLibraryPath())
+    logging.debug("opensslVerify loaded: %s", ssl._lib)
 
-openLibrary()
+if __name__ == "__main__":
+    ssl = _OpenSSL(sys.argv[1])
+else:
+    openLibrary()
+
 openssl_version = "%.9X" % ssl._lib.SSLeay()
 
 NID_secp256k1 = 714
@@ -321,7 +322,7 @@ def verify_message(address, signature, message):
 def SetCompactSignature(pkey, hash, signature):
     sig = base64.b64decode(signature)
     if len(sig) != 65:
-        raise BaseException("Wrong encoding")
+        raise Exception("Wrong encoding")
     nV = ord(sig[0])
     if nV < 27 or nV >= 35:
         return False
@@ -396,10 +397,15 @@ def ECDSA_SIG_recover_key_GFp(eckey, r, s, msg, msglen, recid, check):
 
 
 def closeLibrary():
+    handle = ssl._lib._handle
     if "FreeLibrary" in dir(_ctypes):
-        _ctypes.FreeLibrary(ssl._lib._handle)
+        _ctypes.FreeLibrary(handle)
+        _ctypes.FreeLibrary(handle)
+        print "OpenSSL closed, handle:", handle
     else:
-        _ctypes.dlclose(ssl._lib._handle)
+        _ctypes.dlclose(handle)
+        _ctypes.dlclose(handle)
+        print "OpenSSL dlclosed, handle:", handle
 
 
 def getMessagePubkey(message, sig):
@@ -434,15 +440,16 @@ if __name__ == "__main__":
     import time
     import os
     import sys
-    sys.path.append("..")
-    from pybitcointools import bitcoin as btctools
+    sys.path.append("../pybitcointools")
+    import bitcoin as btctools
     print "OpenSSL version %s" % openssl_version
+    print ssl._lib
     priv = "5JsunC55XGVqFQj5kPGK4MWgTL26jKbnPhjnmchSNPo75XXCwtk"
     address = "1N2XWu5soeppX2qUjvrf81rpdbShKJrjTr"
     sign = btctools.ecdsa_sign("hello", priv)  # HGbib2kv9gm9IJjDt1FXbXFczZi35u0rZR3iPUIt5GglDDCeIQ7v8eYXVNIaLoJRI4URGZrhwmsYQ9aVtRTnTfQ=
 
     s = time.time()
-    for i in range(100):
+    for i in range(1000):
         pubkey = getMessagePubkey("hello", sign)
         verified = btctools.pubkey_to_address(pubkey) == address
-    print "100x Verified", verified, time.time() - s
+    print "1000x Verified", verified, time.time() - s

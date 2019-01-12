@@ -1,28 +1,26 @@
-FROM ubuntu:14.04
-
-MAINTAINER Felix Imobersteg <felix@whatwedo.ch>
+FROM alpine:3.8
 
 #Base settings
-ENV DEBIAN_FRONTEND noninteractive
 ENV HOME /root
 
-#Update package lists
-RUN apt-get update -y
-
-#Install ZeroNet deps
-RUN apt-get install msgpack-python python-gevent python-pip python-dev -y
-RUN pip install msgpack-python --upgrade
+#Install ZeroNet
+RUN apk --no-cache --no-progress add musl-dev gcc python python-dev py2-pip tor \
+ && pip install --no-cache-dir gevent msgpack \
+ && apk del musl-dev gcc python-dev py2-pip \
+ && echo "ControlPort 9051" >> /etc/tor/torrc \
+ && echo "CookieAuthentication 1" >> /etc/tor/torrc
 
 #Add Zeronet source
-ADD . /root
+COPY . /root
+VOLUME /root/data
 
-#Slimming down Docker containers
-RUN apt-get clean -y
-RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+#Control if Tor proxy is started
+ENV ENABLE_TOR false
+
+WORKDIR /root
 
 #Set upstart command
-CMD cd /root && python zeronet.py --ui_ip 0.0.0.0
+CMD (! ${ENABLE_TOR} || tor&) && python zeronet.py --ui_ip 0.0.0.0 --fileserver_port 26552
 
 #Expose ports
-EXPOSE 43110
-EXPOSE 15441
+EXPOSE 43110 26552

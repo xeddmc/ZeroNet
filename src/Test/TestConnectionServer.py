@@ -2,9 +2,11 @@ import time
 import gevent
 
 import pytest
+import mock
 
 from Crypt import CryptConnection
 from Connection import ConnectionServer
+from Config import config
 
 
 @pytest.mark.usefixtures("resetSettings")
@@ -15,9 +17,10 @@ class TestConnection:
         assert file_server != client
 
         # Connect to myself
-        connection = client.getConnection("127.0.0.1", 1544)
+        with mock.patch('Config.config.ip_local', return_value=[]):  # SSL not used for local ips
+            connection = client.getConnection("127.0.0.1", 1544)
+
         assert len(file_server.connections) == 1
-        assert len(file_server.ips) == 1
         assert connection.handshake
         assert connection.crypt
 
@@ -26,7 +29,6 @@ class TestConnection:
         client.stop()
         time.sleep(0.01)
         assert len(file_server.connections) == 0
-        assert len(file_server.ips) == 0
 
     def testRawConnection(self, file_server):
         file_server.ip_incoming = {}  # Reset flood protection
@@ -37,7 +39,9 @@ class TestConnection:
         crypt_supported_bk = CryptConnection.manager.crypt_supported
         CryptConnection.manager.crypt_supported = []
 
-        connection = client.getConnection("127.0.0.1", 1544)
+        print "---"
+        with mock.patch('Config.config.ip_local', return_value=[]):  # SSL not used for local ips
+            connection = client.getConnection("127.0.0.1", 1544)
         assert len(file_server.connections) == 1
         assert not connection.crypt
 
@@ -79,22 +83,20 @@ class TestConnection:
 
     def testFloodProtection(self, file_server):
         file_server.ip_incoming = {}  # Reset flood protection
+        whitelist = file_server.whitelist  # Save for reset
+        file_server.whitelist = []  # Disable 127.0.0.1 whitelist
         client = ConnectionServer("127.0.0.1", 1545)
 
-        # Only allow 3 connection in 1 minute
-        connection = client.getConnection("127.0.0.1", 1544)
-        assert connection.handshake
-        connection.close()
+        # Only allow 6 connection in 1 minute
+        for reconnect in range(6):
+            connection = client.getConnection("127.0.0.1", 1544)
+            assert connection.handshake
+            connection.close()
 
-        connection = client.getConnection("127.0.0.1", 1544)
-        assert connection.handshake
-        connection.close()
-
-        connection = client.getConnection("127.0.0.1", 1544)
-        assert connection.handshake
-        connection.close()
-
-        # The 4. one will timeout
+        # The 7. one will timeout
         with pytest.raises(gevent.Timeout):
             with gevent.Timeout(0.1):
                 connection = client.getConnection("127.0.0.1", 1544)
+
+        # Reset whitelist
+        file_server.whitelist = whitelist

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.7
 
 
 # Included modules
@@ -9,7 +9,7 @@ import zeronet
 
 
 def main():
-    sys.argv += ["--open_browser", "default_browser"]
+    sys.argv = [sys.argv[0]]+["--open_browser", "default_browser"]+sys.argv[1:]
     zeronet.main()
 
 if __name__ == '__main__':

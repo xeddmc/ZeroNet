@@ -10,7 +10,17 @@ from util import helper
 
 # Find files with extension in path
 def findfiles(path, find_ext):
-    for root, dirs, files in os.walk(path, topdown=False):
+    def sorter(f1, f2):
+        f1 = f1[0].replace(path, "")
+        f2 = f2[0].replace(path, "")
+        if f1 == "":
+            return 1
+        elif f2 == "":
+            return -1
+        else:
+            return cmp(f1.lower(), f2.lower())
+
+    for root, dirs, files in sorted(os.walk(path, topdown=False), cmp=sorter):
         for file in sorted(files):
             file_path = root + "/" + file
             file_ext = file.split(".")[-1]
@@ -50,7 +60,7 @@ def merge(merged_path):
 
     changed = {}
     for file_path in findfiles(merge_dir, find_ext):
-        if os.path.getmtime(file_path) > merged_mtime:
+        if os.path.getmtime(file_path) > merged_mtime + 1:
             changed[file_path] = True
     if not changed:
         return  # Assets not changed, nothing to do
@@ -65,17 +75,17 @@ def merge(merged_path):
     parts = []
     s_total = time.time()
     for file_path in findfiles(merge_dir, find_ext):
-        parts.append("\n\n/* ---- %s ---- */\n\n" % file_path)
+        parts.append("\n\n/* ---- %s ---- */\n\n" % file_path.replace(config.data_dir, ""))
         if file_path.endswith(".coffee"):  # Compile coffee script
-            if file_path in changed or file_path not in old_parts:  # Only recompile if changed or its not compiled before
+            if file_path in changed or file_path.replace(config.data_dir, "") not in old_parts:  # Only recompile if changed or its not compiled before
                 if config.coffeescript_compiler is None:
                     config.coffeescript_compiler = findCoffeescriptCompiler()
                 if not config.coffeescript_compiler:
-                    logging.error("No coffeescript compiler definied, skipping compiling %s" % merged_path)
+                    logging.error("No coffeescript compiler defined, skipping compiling %s" % merged_path)
                     return False  # No coffeescript compiler, skip this file
 
                 # Replace / with os separators and escape it
-                file_path_escaped = helper.shellquote(os.path.join(*file_path.split("/")))
+                file_path_escaped = helper.shellquote(file_path.replace("/", os.path.sep))
 
                 if "%s" in config.coffeescript_compiler:  # Replace %s with coffeescript file
                     command = config.coffeescript_compiler % file_path_escaped
@@ -100,7 +110,7 @@ def merge(merged_path):
                         (file_path, re.escape(error).replace("\n", "\\n").replace(r"\\n", r"\n"))
                     )
             else:  # Not changed use the old_part
-                parts.append(old_parts[file_path])
+                parts.append(old_parts[file_path.replace(config.data_dir, "")])
         else:  # Add to parts
             parts.append(open(file_path).read().decode("utf8"))
 

@@ -1,30 +1,43 @@
 import logging
 import os
 import sys
+import shutil
+import time
+from collections import defaultdict
 
 from Debug import Debug
 from Config import config
 
 
 class PluginManager:
-
     def __init__(self):
         self.log = logging.getLogger("PluginManager")
         self.plugin_path = "plugins"  # Plugin directory
-        self.plugins = {}  # Registered plugins (key: class name, value: list of plugins for class)
+        self.plugins = defaultdict(list)  # Registered plugins (key: class name, value: list of plugins for class)
+        self.subclass_order = {}  # Record the load order of the plugins, to keep it after reload
+        self.pluggable = {}
         self.plugin_names = []  # Loaded plugin names
+        self.after_load = []  # Execute functions after loaded plugins
 
-        sys.path.append(self.plugin_path)
+        sys.path.append(os.path.join(os.getcwd(), self.plugin_path))
+        self.migratePlugins()
 
         if config.debug:  # Auto reload Plugins on file change
             from Debug import DebugReloader
             DebugReloader(self.reloadPlugins)
 
+    def migratePlugins(self):
+        for dir_name in os.listdir(self.plugin_path):
+            if dir_name == "Mute":
+                self.log.info("Deleting deprecated/renamed plugin: %s" % dir_name)
+                shutil.rmtree("%s/%s" % (self.plugin_path, dir_name))
+
     # -- Load / Unload --
 
     # Load all plugin
     def loadPlugins(self):
-        for dir_name in os.listdir(self.plugin_path):
+        s = time.time()
+        for dir_name in sorted(os.listdir(self.plugin_path)):
             dir_path = os.path.join(self.plugin_path, dir_name)
             if dir_name.startswith("disabled"):
                 continue  # Dont load if disabled
@@ -40,18 +53,63 @@ class PluginManager:
             if dir_name not in self.plugin_names:
                 self.plugin_names.append(dir_name)
 
+        self.log.debug("Plugins loaded in %.3fs" % (time.time() - s))
+        for func in self.after_load:
+            func()
+
     # Reload all plugins
     def reloadPlugins(self):
-        self.plugins = {}  # Reset registered plugins
+        self.after_load = []
+        self.plugins_before = self.plugins
+        self.plugins = defaultdict(list)  # Reset registered plugins
         for module_name, module in sys.modules.items():
             if module and "__file__" in dir(module) and self.plugin_path in module.__file__:  # Module file within plugin_path
-                if "allow_reload" not in dir(module) or module.allow_reload:  # Check if reload disabled
+                if "allow_reload" in dir(module) and not module.allow_reload:  # Reload disabled
+                    # Re-add non-reloadable plugins
+                    for class_name, classes in self.plugins_before.iteritems():
+                        for c in classes:
+                            if c.__module__ != module.__name__:
+                                continue
+                            self.plugins[class_name].append(c)
+                else:
                     try:
                         reload(module)
                     except Exception, err:
                         self.log.error("Plugin %s reload error: %s" % (module_name, Debug.formatException(err)))
 
         self.loadPlugins()  # Load new plugins
+
+        # Change current classes in memory
+        import gc
+        patched = {}
+        for class_name, classes in self.plugins.iteritems():
+            classes = classes[:]  # Copy the current plugins
+            classes.reverse()
+            base_class = self.pluggable[class_name]  # Original class
+            classes.append(base_class)  # Add the class itself to end of inherience line
+            plugined_class = type(class_name, tuple(classes), dict())  # Create the plugined class
+            for obj in gc.get_objects():
+                if type(obj).__name__ == class_name:
+                    obj.__class__ = plugined_class
+                    patched[class_name] = patched.get(class_name, 0) + 1
+        self.log.debug("Patched objects: %s" % patched)
+
+        # Change classes in modules
+        patched = {}
+        for class_name, classes in self.plugins.iteritems():
+            for module_name, module in sys.modules.iteritems():
+                if class_name in dir(module):
+                    if "__class__" not in dir(getattr(module, class_name)):  # Not a class
+                        continue
+                    base_class = self.pluggable[class_name]
+                    classes = self.plugins[class_name][:]
+                    classes.reverse()
+                    classes.append(base_class)
+                    plugined_class = type(class_name, tuple(classes), dict())
+                    setattr(module, class_name, plugined_class)
+                    patched[class_name] = patched.get(class_name, 0) + 1
+
+        self.log.debug("Patched modules: %s" % patched)
 
 
 plugin_manager = PluginManager()  # Singletone
@@ -63,8 +121,21 @@ plugin_manager = PluginManager()  # Singletone
 
 def acceptPlugins(base_class):
     class_name = base_class.__name__
+    plugin_manager.pluggable[class_name] = base_class
     if class_name in plugin_manager.plugins:  # Has plugins
         classes = plugin_manager.plugins[class_name][:]  # Copy the current plugins
+
+        # Restore the subclass order after reload
+        if class_name in plugin_manager.subclass_order:
+            classes = sorted(
+                classes,
+                key=lambda key:
+                    plugin_manager.subclass_order[class_name].index(str(key))
+                    if str(key) in plugin_manager.subclass_order[class_name]
+                    else 9999
+            )
+        plugin_manager.subclass_order[class_name] = map(str, classes)
+
         classes.reverse()
         classes.append(base_class)  # Add the class itself to end of inherience line
         plugined_class = type(class_name, tuple(classes), dict())  # Create the plugined class
@@ -84,6 +155,11 @@ def registerTo(class_name):
         plugin_manager.plugins[class_name].append(self)
         return self
     return classDecorator
+
+
+def afterLoad(func):
+    plugin_manager.after_load.append(func)
+    return func
 
 
 # - Example usage -

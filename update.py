@@ -1,32 +1,74 @@
 import urllib
 import zipfile
 import os
+import sys
 import ssl
 import httplib
 import socket
 import re
+import json
 import cStringIO as StringIO
 
-from gevent import monkey
-monkey.patch_all()
+def download():
+    from src.util import helper
+
+    urls = [
+        "https://github.com/HelloZeroNet/ZeroNet/archive/master.zip",
+        "https://gitlab.com/HelloZeroNet/ZeroNet/repository/archive.zip?ref=master",
+        "https://try.gogs.io/ZeroNet/ZeroNet/archive/master.zip"
+    ]
+
+    zipdata = None
+    for url in urls:
+        print "Downloading from:", url,
+        try:
+            req = helper.httpRequest(url)
+            data = StringIO.StringIO()
+            while True:
+                buff = req.read(1024 * 16)
+                if not buff:
+                    break
+                data.write(buff)
+                print ".",
+            try:
+                zipdata = zipfile.ZipFile(data)
+                break  # Success
+            except Exception, err:
+                data.seek(0)
+                print "Unpack error", err, data.read(256)
+        except Exception, err:
+            print "Error downloading update from %s: %s" % (url, err)
+
+    if not zipdata:
+        raise err
+
+    print "Downloaded."
+
+    return zipdata
 
 
 def update():
-    # Gevent https bug workaround (https://github.com/gevent/gevent/issues/477)
-    reload(socket)
-    reload(httplib)
-    reload(ssl)
+    from Config import config
+    if getattr(sys, 'source_update_dir', False):
+        if not os.path.isdir(sys.source_update_dir):
+            os.makedirs(sys.source_update_dir)
+        os.chdir(sys.source_update_dir)  # New source code will be stored in different directory
 
-    print "Downloading.",
-    file = urllib.urlopen("https://github.com/HelloZeroNet/ZeroNet/archive/master.zip")
-    data = StringIO.StringIO()
-    while True:
-        buff = file.read(1024 * 16)
-        if not buff:
-            break
-        data.write(buff)
-        print ".",
-    print "Downloaded."
+    updatesite_path = config.data_dir + "/" + config.updatesite
+    sites_json = json.load(open(config.data_dir + "/sites.json"))
+    updatesite_bad_files = sites_json.get(config.updatesite, {}).get("cache", {}).get("bad_files", {})
+    print "Update site path: %s, bad_files: %s" % (updatesite_path, len(updatesite_bad_files))
+    if os.path.isfile(updatesite_path + "/content.json") and len(updatesite_bad_files) == 0 and sites_json.get(config.updatesite, {}).get("serving"):
+        # Update site exists and no broken file
+        print "Updating using site %s" % config.updatesite
+        zipdata = False
+        inner_paths = json.load(open(updatesite_path + "/content.json"))["files"].keys()
+        # Keep file only in ZeroNet directory
+        inner_paths = [inner_path for inner_path in inner_paths if inner_path.startswith("ZeroNet/")]
+    else:
+        # Fallback to download
+        zipdata = download()
+        inner_paths = zipdata.namelist()
 
     # Checking plugins
     plugins_enabled = []
@@ -39,12 +81,14 @@ def update():
                 plugins_enabled.append(dir)
         print "Plugins enabled:", plugins_enabled, "disabled:", plugins_disabled
 
-    print "Extracting...",
-    zip = zipfile.ZipFile(data)
-    for inner_path in zip.namelist():
+    print "Extracting to %s..." % os.getcwd(),
+    for inner_path in inner_paths:
+        if ".." in inner_path:
+            continue
         inner_path = inner_path.replace("\\", "/")  # Make sure we have unix path
         print ".",
-        dest_path = inner_path.replace("ZeroNet-master/", "")
+        dest_path = re.sub("^([^/]*-master.*?|ZeroNet)/", "", inner_path)  # Skip root zeronet-master-... like directories
+        dest_path = dest_path.lstrip("/")
         if not dest_path:
             continue
 
@@ -64,16 +108,32 @@ def update():
             os.makedirs(dest_dir)
 
         if dest_dir != dest_path.strip("/"):
-            data = zip.read(inner_path)
+            if zipdata:
+                data = zipdata.read(inner_path)
+            else:
+                data = open(updatesite_path + "/" + inner_path, "rb").read()
+
             try:
                 open(dest_path, 'wb').write(data)
             except Exception, err:
                 print dest_path, err
 
     print "Done."
+    return True
 
 
 if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))  # Imports relative to src
+
+    from gevent import monkey
+    monkey.patch_all()
+
+    from Config import config
+    config.parse(silent=True)
+
+    from src.util import SslPatch
+
     try:
         update()
     except Exception, err:

@@ -4,21 +4,28 @@ import cgi
 import sys
 import math
 import time
+import json
 try:
     import cStringIO as StringIO
 except:
     import StringIO
 
+import gevent
 
 from Config import config
 from Plugin import PluginManager
 from Debug import Debug
+from Translate import Translate
+from util import helper
+from ZipStream import ZipStream
 
 plugin_dir = "plugins/Sidebar"
 media_dir = plugin_dir + "/media"
 sys.path.append(plugin_dir)  # To able to load geoip lib
 
 loc_cache = {}
+if "_" not in locals():
+    _ = Translate(plugin_dir + "/languages/")
 
 
 @PluginManager.registerTo("UiRequest")
@@ -38,8 +45,11 @@ class UiRequestPlugin(object):
                 # If debugging merge *.css to all.css and *.js to all.js
                 from Debug import DebugMedia
                 DebugMedia.merge(plugin_media_file)
-            for part in self.actionFile(plugin_media_file, send_header=False):
-                yield part
+            if ext == "js":
+                yield _.translateData(open(plugin_media_file).read())
+            else:
+                for part in self.actionFile(plugin_media_file, send_header=False):
+                    yield part
         elif path.startswith("/uimedia/globe/"):  # Serve WebGL globe files
             file_name = re.match(".*/(.*)", path).group(1)
             plugin_media_file = "%s-globe/%s" % (media_dir, file_name)
@@ -53,34 +63,86 @@ class UiRequestPlugin(object):
             for part in super(UiRequestPlugin, self).actionUiMedia(path):
                 yield part
 
+    def actionZip(self):
+        address = self.get["address"]
+        site = self.server.site_manager.get(address)
+        if not site:
+            return self.error404("Site not found")
+
+        title = site.content_manager.contents.get("content.json", {}).get("title", "").encode('ascii', 'ignore')
+        filename = "%s-backup-%s.zip" % (title, time.strftime("%Y-%m-%d_%H_%M"))
+        self.sendHeader(content_type="application/zip", extra_headers={'Content-Disposition': 'attachment; filename="%s"' % filename})
+
+        return self.streamZip(site.storage.getPath("."))
+
+    def streamZip(self, file_path):
+        zs = ZipStream(file_path)
+        while 1:
+            data = zs.read()
+            if not data:
+                break
+            yield data
+
+
+
 
 @PluginManager.registerTo("UiWebsocket")
 class UiWebsocketPlugin(object):
-
     def sidebarRenderPeerStats(self, body, site):
         connected = len([peer for peer in site.peers.values() if peer.connection and peer.connection.connected])
         connectable = len([peer_id for peer_id in site.peers.keys() if not peer_id.endswith(":0")])
+        onion = len([peer_id for peer_id in site.peers.keys() if ".onion" in peer_id])
+        local = len([peer for peer in site.peers.values() if helper.isPrivateIp(peer.ip)])
         peers_total = len(site.peers)
+
+        # Add myself
+        if site.settings["serving"]:
+            peers_total += 1
+            if site.connection_server.port_opened:
+                connectable += 1
+            if site.connection_server.tor_manager.start_onions:
+                onion += 1
+
         if peers_total:
             percent_connected = float(connected) / peers_total
             percent_connectable = float(connectable) / peers_total
+            percent_onion = float(onion) / peers_total
         else:
-            percent_connectable = percent_connected = 0
-        body.append("""
+            percent_connectable = percent_connected = percent_onion = 0
+
+        if local:
+            local_html = _(u"<li class='color-yellow'><span>{_[Local]}:</span><b>{local}</b></li>")
+        else:
+            local_html = ""
+
+        peer_ips = [peer.key for peer in site.getConnectablePeers(20, allow_private=False)]
+        peer_ips.sort(key=lambda peer_ip: ".onion:" in peer_ip)
+        copy_link = "http://127.0.0.1:43110/%s/?zeronet_peers=%s" % (
+            site.content_manager.contents["content.json"].get("domain", site.address),
+            ",".join(peer_ips)
+        )
+
+        body.append(_(u"""
             <li>
-             <label>Peers</label>
+             <label>
+              {_[Peers]}
+              <small class="label-right"><a href='{copy_link}' id='link-copypeers' class='link-right'>{_[Copy to clipboard]}</a></small>
+             </label>
              <ul class='graph'>
-              <li style='width: 100%' class='total back-black' title="Total peers"></li>
-              <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='Connectable peers'></li>
-              <li style='width: {percent_connected:.0%}' class='connected back-green' title='Connected peers'></li>
+              <li style='width: 100%' class='total back-black' title="{_[Total peers]}"></li>
+              <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='{_[Connectable peers]}'></li>
+              <li style='width: {percent_onion:.0%}' class='connected back-purple' title='{_[Onion]}'></li>
+              <li style='width: {percent_connected:.0%}' class='connected back-green' title='{_[Connected peers]}'></li>
              </ul>
              <ul class='graph-legend'>
-              <li class='color-green'><span>connected:</span><b>{connected}</b></li>
-              <li class='color-blue'><span>Connectable:</span><b>{connectable}</b></li>
-              <li class='color-black'><span>Total:</span><b>{peers_total}</b></li>
+              <li class='color-green'><span>{_[Connected]}:</span><b>{connected}</b></li>
+              <li class='color-blue'><span>{_[Connectable]}:</span><b>{connectable}</b></li>
+              <li class='color-purple'><span>{_[Onion]}:</span><b>{onion}</b></li>
+              {local_html}
+              <li class='color-black'><span>{_[Total]}:</span><b>{peers_total}</b></li>
              </ul>
             </li>
-        """.format(**locals()))
+        """.replace("{local_html}", local_html)))
 
     def sidebarRenderTransferStats(self, body, site):
         recv = float(site.settings.get("bytes_recv", 0)) / 1024 / 1024
@@ -92,67 +154,100 @@ class UiWebsocketPlugin(object):
         else:
             percent_recv = 0.5
             percent_sent = 0.5
-        body.append("""
+
+        body.append(_(u"""
             <li>
-             <label>Data transfer</label>
+             <label>{_[Data transfer]}</label>
              <ul class='graph graph-stacked'>
-              <li style='width: {percent_recv:.0%}' class='received back-yellow' title="Received bytes"></li>
-              <li style='width: {percent_sent:.0%}' class='sent back-green' title="Sent bytes"></li>
+              <li style='width: {percent_recv:.0%}' class='received back-yellow' title="{_[Received bytes]}"></li>
+              <li style='width: {percent_sent:.0%}' class='sent back-green' title="{_[Sent bytes]}"></li>
              </ul>
              <ul class='graph-legend'>
-              <li class='color-yellow'><span>Received:</span><b>{recv:.2f}MB</b></li>
-              <li class='color-green'<span>Sent:</span><b>{sent:.2f}MB</b></li>
+              <li class='color-yellow'><span>{_[Received]}:</span><b>{recv:.2f}MB</b></li>
+              <li class='color-green'<span>{_[Sent]}:</span><b>{sent:.2f}MB</b></li>
              </ul>
             </li>
-        """.format(**locals()))
+        """))
 
     def sidebarRenderFileStats(self, body, site):
-        body.append("<li><label>Files</label><ul class='graph graph-stacked'>")
+        body.append(_(u"""
+            <li>
+             <label>
+              {_[Files]}
+              <small class="label-right"><a href='#Site+directory' id='link-directory' class='link-right'>{_[Open site directory]}</a>
+              <a href='/ZeroNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Save as .zip]}</a></small>
+             </label>
+             <ul class='graph graph-stacked'>
+        """))
 
         extensions = (
             ("html", "yellow"),
             ("css", "orange"),
             ("js", "purple"),
-            ("image", "green"),
-            ("json", "blue"),
-            ("other", "white"),
-            ("total", "black")
+            ("Image", "green"),
+            ("json", "darkblue"),
+            ("User data", "blue"),
+            ("Other", "white"),
+            ("Total", "black")
         )
         # Collect stats
         size_filetypes = {}
         size_total = 0
-        for content in site.content_manager.contents.values():
-            if "files" not in content:
+        contents = site.content_manager.listContents()  # Without user files
+        for inner_path in contents:
+            content = site.content_manager.contents[inner_path]
+            if "files" not in content or content["files"] is None:
                 continue
             for file_name, file_details in content["files"].items():
                 size_total += file_details["size"]
                 ext = file_name.split(".")[-1]
                 size_filetypes[ext] = size_filetypes.get(ext, 0) + file_details["size"]
-        size_other = size_total
+
+        # Get user file sizes
+        size_user_content = site.content_manager.contents.execute(
+            "SELECT SUM(size) + SUM(size_files) AS size FROM content WHERE ?",
+            {"not__inner_path": contents}
+        ).fetchone()["size"]
+        if not size_user_content:
+            size_user_content = 0
+        size_filetypes["User data"] = size_user_content
+        size_total += size_user_content
+
+        # The missing difference is content.json sizes
+        if "json" in size_filetypes:
+            size_filetypes["json"] += max(0, site.settings["size"] - size_total)
+        size_total = size_other = site.settings["size"]
 
         # Bar
         for extension, color in extensions:
-            if extension == "total":
+            if extension == "Total":
                 continue
-            if extension == "other":
-                size = size_other
-            elif extension == "image":
+            if extension == "Other":
+                size = max(0, size_other)
+            elif extension == "Image":
                 size = size_filetypes.get("jpg", 0) + size_filetypes.get("png", 0) + size_filetypes.get("gif", 0)
                 size_other -= size
             else:
                 size = size_filetypes.get(extension, 0)
                 size_other -= size
-            percent = 100 * (float(size) / size_total)
-            body.append("<li style='width: %.2f%%' class='%s back-%s' title='%s'></li>" % (percent, extension, color, extension))
+            if size_total == 0:
+                percent = 0
+            else:
+                percent = 100 * (float(size) / size_total)
+            percent = math.floor(percent * 100) / 100  # Floor to 2 digits
+            body.append(
+                u"""<li style='width: %.2f%%' class='%s back-%s' title="%s"></li>""" %
+                (percent, _[extension], color, _[extension])
+            )
 
         # Legend
         body.append("</ul><ul class='graph-legend'>")
         for extension, color in extensions:
-            if extension == "other":
-                size = size_other
-            elif extension == "image":
+            if extension == "Other":
+                size = max(0, size_other)
+            elif extension == "Image":
                 size = size_filetypes.get("jpg", 0) + size_filetypes.get("png", 0) + size_filetypes.get("gif", 0)
-            elif extension == "total":
+            elif extension == "Total":
                 size = size_total
             else:
                 size = size_filetypes.get(extension, 0)
@@ -167,63 +262,192 @@ class UiWebsocketPlugin(object):
             else:
                 size_formatted = "%.0fkB" % (size / 1024)
 
-            body.append("<li class='color-%s'><span>%s:</span><b>%s</b></li>" % (color, title, size_formatted))
+            body.append(u"<li class='color-%s'><span>%s:</span><b>%s</b></li>" % (color, _[title], size_formatted))
 
         body.append("</ul></li>")
 
-    def getFreeSpace(self):
-        free_space = 0
-        if "statvfs" in dir(os):  # Unix
-            statvfs = os.statvfs(config.data_dir)
-            free_space = statvfs.f_frsize * statvfs.f_bavail
-        else:  # Windows
-            try:
-                import ctypes
-                free_space_pointer = ctypes.c_ulonglong(0)
-                ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-                    ctypes.c_wchar_p(config.data_dir), None, None, ctypes.pointer(free_space_pointer)
-                )
-                free_space = free_space_pointer.value
-            except Exception, err:
-                self.log.debug("GetFreeSpace error: %s" % err)
-        return free_space
-
     def sidebarRenderSizeLimit(self, body, site):
-        free_space = self.getFreeSpace() / 1024 / 1024
+        free_space = helper.getFreeSpace() / 1024 / 1024
         size = float(site.settings["size"]) / 1024 / 1024
         size_limit = site.getSizeLimit()
         percent_used = size / size_limit
-        body.append("""
-            <li>
-             <label>Size limit <small>(limit used: {percent_used:.0%}, free space: {free_space:,d}MB)</small></label>
-             <input type='text' class='text text-num' value='{size_limit}' id='input-sitelimit'/><span class='text-post'>MB</span>
-             <a href='#Set' class='button' id='button-sitelimit'>Set</a>
-            </li>
-        """.format(**locals()))
 
-    def sidebarRenderDbOptions(self, body, site):
-        if not site.storage.db:
+        body.append(_(u"""
+            <li>
+             <label>{_[Size limit]} <small>({_[limit used]}: {percent_used:.0%}, {_[free space]}: {free_space:,d}MB)</small></label>
+             <input type='text' class='text text-num' value="{size_limit}" id='input-sitelimit'/><span class='text-post'>MB</span>
+             <a href='#Set' class='button' id='button-sitelimit'>{_[Set]}</a>
+            </li>
+        """))
+
+    def sidebarRenderOptionalFileStats(self, body, site):
+        size_total = float(site.settings["size_optional"])
+        size_downloaded = float(site.settings["optional_downloaded"])
+
+        if not size_total:
             return False
 
-        inner_path = site.storage.getInnerPath(site.storage.db.db_path)
-        size = float(site.storage.getSize(inner_path)) / 1024
-        body.append("""
+        percent_downloaded = size_downloaded / size_total
+
+        size_formatted_total = size_total / 1024 / 1024
+        size_formatted_downloaded = size_downloaded / 1024 / 1024
+
+        body.append(_(u"""
             <li>
-             <label>Database <small>({size:.2f}kB)</small></label>
-             <input type='text' class='text disabled' value='{inner_path}' disabled='disabled'/>
-             <a href='#Reindex' class='button' style='display: none'>Reindex</a>
+             <label>{_[Optional files]}</label>
+             <ul class='graph'>
+              <li style='width: 100%' class='total back-black' title="{_[Total size]}"></li>
+              <li style='width: {percent_downloaded:.0%}' class='connected back-green' title='{_[Downloaded files]}'></li>
+             </ul>
+             <ul class='graph-legend'>
+              <li class='color-green'><span>{_[Downloaded]}:</span><b>{size_formatted_downloaded:.2f}MB</b></li>
+              <li class='color-black'><span>{_[Total]}:</span><b>{size_formatted_total:.2f}MB</b></li>
+             </ul>
             </li>
-        """.format(**locals()))
+        """))
+
+        return True
+
+    def sidebarRenderOptionalFileSettings(self, body, site):
+        if self.site.settings.get("autodownloadoptional"):
+            checked = "checked='checked'"
+        else:
+            checked = ""
+
+        body.append(_(u"""
+            <li>
+             <label>{_[Download and help distribute all files]}</label>
+             <input type="checkbox" class="checkbox" id="checkbox-autodownloadoptional" {checked}/><div class="checkbox-skin"></div>
+        """))
+
+        autodownload_bigfile_size_limit = int(site.settings.get("autodownload_bigfile_size_limit", config.autodownload_bigfile_size_limit))
+        body.append(_(u"""
+            <div class='settings-autodownloadoptional'>
+             <label>{_[Auto download big file size limit]}</label>
+             <input type='text' class='text text-num' value="{autodownload_bigfile_size_limit}" id='input-autodownload_bigfile_size_limit'/><span class='text-post'>MB</span>
+             <a href='#Set' class='button' id='button-autodownload_bigfile_size_limit'>{_[Set]}</a>
+            </div>
+        """))
+        body.append("</li>")
+
+    def sidebarRenderBadFiles(self, body, site):
+        body.append(_(u"""
+            <li>
+             <label>{_[Needs to be updated]}:</label>
+             <ul class='filelist'>
+        """))
+
+        i = 0
+        for bad_file, tries in site.bad_files.iteritems():
+            i += 1
+            body.append(_(u"""<li class='color-red' title="{bad_file_path} ({tries})">{bad_filename}</li>""", {
+                "bad_file_path": bad_file,
+                "bad_filename": helper.getFilename(bad_file),
+                "tries": _.pluralize(tries, "{} try", "{} tries")
+            }))
+            if i > 30:
+                break
+
+        if len(site.bad_files) > 30:
+            num_bad_files = len(site.bad_files) - 30
+            body.append(_(u"""<li class='color-red'>{_[+ {num_bad_files} more]}</li>""", nested=True))
+
+        body.append("""
+             </ul>
+            </li>
+        """)
+
+    def sidebarRenderDbOptions(self, body, site):
+        if site.storage.db:
+            inner_path = site.storage.getInnerPath(site.storage.db.db_path)
+            size = float(site.storage.getSize(inner_path)) / 1024
+            feeds = len(site.storage.db.schema.get("feeds", {}))
+        else:
+            inner_path = _[u"No database found"]
+            size = 0.0
+            feeds = 0
+
+        body.append(_(u"""
+            <li>
+             <label>{_[Database]} <small>({size:.2f}kB, {_[search feeds]}: {_[{feeds} query]})</small></label>
+             <div class='flex'>
+              <input type='text' class='text disabled' value="{inner_path}" disabled='disabled'/>
+              <a href='#Reload' id="button-dbreload" class='button'>{_[Reload]}</a>
+              <a href='#Rebuild' id="button-dbrebuild" class='button'>{_[Rebuild]}</a>
+             </div>
+            </li>
+        """, nested=True))
 
     def sidebarRenderIdentity(self, body, site):
         auth_address = self.user.getAuthAddress(self.site.address)
-        body.append("""
+        rules = self.site.content_manager.getRules("data/users/%s/content.json" % auth_address)
+        if rules and rules.get("max_size"):
+            quota = rules["max_size"] / 1024
+            try:
+                content = site.content_manager.contents["data/users/%s/content.json" % auth_address]
+                used = len(json.dumps(content)) + sum([file["size"] for file in content["files"].values()])
+            except:
+                used = 0
+            used = used / 1024
+        else:
+            quota = used = 0
+
+        body.append(_(u"""
             <li>
-             <label>Identity address</label>
-             <span class='input text disabled'>{auth_address}</span>
-             <a href='#Change' class='button' id='button-identity'>Change</a>
+             <label>{_[Identity address]} <small>({_[limit used]}: {used:.2f}kB / {quota:.2f}kB)</small></label>
+             <div class='flex'>
+              <span class='input text disabled'>{auth_address}</span>
+              <a href='#Change' class='button' id='button-identity'>{_[Change]}</a>
+             </div>
             </li>
-        """.format(**locals()))
+        """))
+
+    def sidebarRenderControls(self, body, site):
+        auth_address = self.user.getAuthAddress(self.site.address)
+        if self.site.settings["serving"]:
+            class_pause = ""
+            class_resume = "hidden"
+        else:
+            class_pause = "hidden"
+            class_resume = ""
+
+        body.append(_(u"""
+            <li>
+             <label>{_[Site control]}</label>
+             <a href='#Update' class='button noupdate' id='button-update'>{_[Update]}</a>
+             <a href='#Pause' class='button {class_pause}' id='button-pause'>{_[Pause]}</a>
+             <a href='#Resume' class='button {class_resume}' id='button-resume'>{_[Resume]}</a>
+             <a href='#Delete' class='button noupdate' id='button-delete'>{_[Delete]}</a>
+            </li>
+        """))
+
+        donate_key = site.content_manager.contents.get("content.json", {}).get("donate", True)
+        site_address = self.site.address
+        body.append(_(u"""
+            <li>
+             <label>{_[Site address]}</label><br>
+             <div class='flex'>
+              <span class='input text disabled'>{site_address}</span>
+        """))
+        if donate_key == False or donate_key == "":
+            pass
+        elif (type(donate_key) == str or type(donate_key) == unicode) and len(donate_key) > 0:
+            body.append(_(u"""
+             </div>
+            </li>
+            <li>
+             <label>{_[Donate]}</label><br>
+             <div class='flex'>
+             {donate_key}
+            """))
+        else:
+            body.append(_(u"""
+              <a href='bitcoin:{site_address}' class='button' id='button-donate'>{_[Donate]}</a>
+            """))
+        body.append(_(u"""
+             </div>
+            </li>
+        """))
 
     def sidebarRenderOwnedCheckbox(self, body, site):
         if self.site.settings["own"]:
@@ -231,62 +455,72 @@ class UiWebsocketPlugin(object):
         else:
             checked = ""
 
-        body.append("""
-            <h2 class='owned-title'>Owned site settings</h2>
+        body.append(_(u"""
+            <h2 class='owned-title'>{_[This is my site]}</h2>
             <input type="checkbox" class="checkbox" id="checkbox-owned" {checked}/><div class="checkbox-skin"></div>
-        """.format(**locals()))
+        """))
 
     def sidebarRenderOwnSettings(self, body, site):
-        title = cgi.escape(site.content_manager.contents["content.json"]["title"], True)
-        description = cgi.escape(site.content_manager.contents["content.json"]["description"], True)
-        privatekey = cgi.escape(self.user.getSiteData(site.address, create=False).get("privatekey", ""))
+        title = site.content_manager.contents.get("content.json", {}).get("title", "")
+        description = site.content_manager.contents.get("content.json", {}).get("description", "")
 
-        body.append("""
+        body.append(_(u"""
             <li>
-             <label for='settings-title'>Site title</label>
+             <label for='settings-title'>{_[Site title]}</label>
              <input type='text' class='text' value="{title}" id='settings-title'/>
             </li>
 
             <li>
-             <label for='settings-description'>Site description</label>
+             <label for='settings-description'>{_[Site description]}</label>
              <input type='text' class='text' value="{description}" id='settings-description'/>
             </li>
 
-            <li style='display: none'>
-             <label>Private key</label>
-             <input type='text' class='text long' value="{privatekey}" placeholder='[Ask on signing]'/>
-            </li>
-
             <li>
-             <a href='#Save' class='button' id='button-settings'>Save site settings</a>
+             <a href='#Save' class='button' id='button-settings'>{_[Save site settings]}</a>
             </li>
-        """.format(**locals()))
+        """))
 
     def sidebarRenderContents(self, body, site):
-        body.append("""
+        has_privatekey = bool(self.user.getSiteData(site.address).get("privatekey"))
+        if has_privatekey:
+            tag_privatekey = _(u"{_[Private key saved.]} <a href='#Forgot+private+key' id='privatekey-forgot' class='link-right'>{_[Forgot]}</a>")
+        else:
+            tag_privatekey = _(u"<a href='#Add+private+key' id='privatekey-add' class='link-right'>{_[Add saved private key]}</a>")
+
+        body.append(_(u"""
             <li>
-             <label>Content publishing</label>
-             <select id='select-contents'>
-        """)
+             <label>{_[Content publishing]} <small class='label-right'>{tag_privatekey}</small></label>
+        """.replace("{tag_privatekey}", tag_privatekey)))
 
-        for inner_path in sorted(site.content_manager.contents.keys()):
-            body.append("<option>%s</option>" % cgi.escape(inner_path, True))
+        # Choose content you want to sign
+        body.append(_(u"""
+             <div class='flex'>
+              <input type='text' class='text' value="content.json" id='input-contents'/>
+              <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>{_[Sign and publish]}</a>
+              <a href='#Sign-or-Publish' id='menu-sign-publish'>\u22EE</a>
+             </div>
+        """))
 
-        body.append("""
-             </select>
-             <span class='select-down'>&rsaquo;</span>
-             <a href='#Sign' class='button' id='button-sign'>Sign</a>
-             <a href='#Publish' class='button' id='button-publish'>Publish</a>
-            </li>
-        """)
+        contents = ["content.json"]
+        contents += site.content_manager.contents.get("content.json", {}).get("includes", {}).keys()
+        body.append(_(u"<div class='contents'>{_[Choose]}: "))
+        for content in contents:
+            body.append(_("<a href='{content}' class='contents-content'>{content}</a> "))
+        body.append("</div>")
+        body.append("</li>")
 
     def actionSidebarGetHtmlTag(self, to):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
         site = self.site
 
         body = []
 
         body.append("<div>")
-        body.append("<h1>%s</h1>" % site.content_manager.contents["content.json"]["title"])
+        body.append("<a href='#Close' class='close'>&times;</a>")
+        body.append("<h1>%s</h1>" % cgi.escape(site.content_manager.contents.get("content.json", {}).get("title", ""), True))
 
         body.append("<div class='globe loading'></div>")
 
@@ -296,8 +530,14 @@ class UiWebsocketPlugin(object):
         self.sidebarRenderTransferStats(body, site)
         self.sidebarRenderFileStats(body, site)
         self.sidebarRenderSizeLimit(body, site)
+        has_optional = self.sidebarRenderOptionalFileStats(body, site)
+        if has_optional:
+            self.sidebarRenderOptionalFileSettings(body, site)
         self.sidebarRenderDbOptions(body, site)
         self.sidebarRenderIdentity(body, site)
+        self.sidebarRenderControls(body, site)
+        if site.bad_files:
+            self.sidebarRenderBadFiles(body, site)
 
         self.sidebarRenderOwnedCheckbox(body, site)
         body.append("<div class='settings-owned'>")
@@ -307,93 +547,160 @@ class UiWebsocketPlugin(object):
         body.append("</ul>")
         body.append("</div>")
 
+        body.append("<div class='menu template'>")
+        body.append("<a href='#'' class='menu-item template'>Template</a>")
+        body.append("</div>")
+
         self.response(to, "".join(body))
 
     def downloadGeoLiteDb(self, db_path):
         import urllib
         import gzip
         import shutil
+        from util import helper
 
         self.log.info("Downloading GeoLite2 City database...")
-        self.cmd("notification", ["geolite-info", "Downloading GeoLite2 City database (one time only, ~15MB)...", 0])
-        try:
-            # Download
-            file = urllib.urlopen("http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz")
-            data = StringIO.StringIO()
-            while True:
-                buff = file.read(1024 * 16)
-                if not buff:
-                    break
-                data.write(buff)
-            self.log.info("GeoLite2 City database downloaded (%s bytes), unpacking..." % data.tell())
-            data.seek(0)
+        self.cmd("progress", ["geolite-info", _["Downloading GeoLite2 City database (one time only, ~20MB)..."], 0])
+        db_urls = [
+            "https://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
+            "https://raw.githubusercontent.com/texnikru/GeoLite2-Database/master/GeoLite2-City.mmdb.gz"
+        ]
+        for db_url in db_urls:
+            try:
+                # Download
+                response = helper.httpRequest(db_url)
+                data_size = response.getheader('content-length')
+                data_recv = 0
+                data = StringIO.StringIO()
+                while True:
+                    buff = response.read(1024 * 512)
+                    if not buff:
+                        break
+                    data.write(buff)
+                    data_recv += 1024 * 512
+                    if data_size:
+                        progress = int(float(data_recv) / int(data_size) * 100)
+                        self.cmd("progress", ["geolite-info", _["Downloading GeoLite2 City database (one time only, ~20MB)..."], progress])
+                self.log.info("GeoLite2 City database downloaded (%s bytes), unpacking..." % data.tell())
+                data.seek(0)
 
-            # Unpack
-            with gzip.GzipFile(fileobj=data) as gzip_file:
-                shutil.copyfileobj(gzip_file, open(db_path, "wb"))
+                # Unpack
+                with gzip.GzipFile(fileobj=data) as gzip_file:
+                    shutil.copyfileobj(gzip_file, open(db_path, "wb"))
 
-            self.cmd("notification", ["geolite-done", "GeoLite2 City database downloaded!", 5000])
-            time.sleep(2)  # Wait for notify animation
-        except Exception, err:
-            self.cmd("notification", ["geolite-error", "GeoLite2 City database download error: %s!" % err, 0])
-            raise err
+                self.cmd("progress", ["geolite-info", _["GeoLite2 City database downloaded!"], 100])
+                time.sleep(2)  # Wait for notify animation
+                return True
+            except Exception as err:
+                self.log.error("Error downloading %s: %s" % (db_url, err))
+                pass
+        self.cmd("progress", [
+            "geolite-info",
+            _["GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}"].format(err, db_urls[0]),
+            -100
+        ])
+
+    def getLoc(self, geodb, ip):
+        global loc_cache
+
+        if ip in loc_cache:
+            return loc_cache[ip]
+        else:
+            try:
+                loc_data = geodb.get(ip)
+            except:
+                loc_data = None
+
+            if not loc_data or "location" not in loc_data:
+                loc_cache[ip] = None
+                return None
+
+            loc = {
+                "lat": loc_data["location"]["latitude"],
+                "lon": loc_data["location"]["longitude"],
+            }
+            if "city" in loc_data:
+                loc["city"] = loc_data["city"]["names"]["en"]
+
+            if "country" in loc_data:
+                loc["country"] = loc_data["country"]["names"]["en"]
+
+            loc_cache[ip] = loc
+            return loc
+
+    def getPeerLocations(self, peers):
+        import maxminddb
+        db_path = config.data_dir + '/GeoLite2-City.mmdb'
+        if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+            if not self.downloadGeoLiteDb(db_path):
+                return False
+        geodb = maxminddb.open_database(db_path)
+
+        peers = peers.values()
+        # Place bars
+        peer_locations = []
+        placed = {}  # Already placed bars here
+        for peer in peers:
+            # Height of bar
+            if peer.connection and peer.connection.last_ping_delay:
+                ping = round(peer.connection.last_ping_delay * 1000)
+            else:
+                ping = None
+            loc = self.getLoc(geodb, peer.ip)
+
+            if not loc:
+                continue
+            # Create position array
+            lat, lon = loc["lat"], loc["lon"]
+            latlon = "%s,%s" % (lat, lon)
+            if latlon in placed:  # Dont place more than 1 bar to same place, fake repos using ip address last two part
+                lat += float(128 - int(peer.ip.split(".")[-2])) / 50
+                lon += float(128 - int(peer.ip.split(".")[-1])) / 50
+                latlon = "%s,%s" % (lat, lon)
+            placed[latlon] = True
+            peer_location = {}
+            peer_location.update(loc)
+            peer_location["lat"] = lat
+            peer_location["lon"] = lon
+            peer_location["ping"] = ping
+
+            peer_locations.append(peer_location)
+
+        # Append myself
+        my_loc = self.getLoc(geodb, config.ip_external)
+        if my_loc:
+            my_loc["ping"] = 0
+            peer_locations.append(my_loc)
+
+        return peer_locations
+
 
     def actionSidebarGetPeers(self, to):
         permissions = self.getPermissions(to)
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         try:
-            import maxminddb
-            db_path = config.data_dir + '/GeoLite2-City.mmdb'
-            if not os.path.isfile(db_path):
-                self.downloadGeoLiteDb(db_path)
-            geodb = maxminddb.open_database(db_path)
-
-            peers = self.site.peers.values()
-            # Find avg ping
+            peer_locations = self.getPeerLocations(self.site.peers)
+            globe_data = []
             ping_times = [
-                peer.connection.last_ping_delay
-                for peer in peers
-                if peer.connection and peer.connection.last_ping_delay and peer.connection.last_ping_delay
+                peer_location["ping"]
+                for peer_location in peer_locations
+                if peer_location["ping"]
             ]
             if ping_times:
                 ping_avg = sum(ping_times) / float(len(ping_times))
             else:
                 ping_avg = 0
-            # Place bars
-            globe_data = []
-            placed = {}  # Already placed bars here
-            for peer in peers:
-                # Height of bar
-                if peer.connection and peer.connection.last_ping_delay:
-                    ping = min(0.20, math.log(1 + peer.connection.last_ping_delay / ping_avg, 300))
+
+            for peer_location in peer_locations:
+                if peer_location["ping"] == 0:  # Me
+                    height = -0.135
+                elif peer_location["ping"]:
+                    height = min(0.20, math.log(1 + peer_location["ping"] / ping_avg, 300))
                 else:
-                    ping = -0.03
+                    height = -0.03
 
-                # Query and cache location
-                if peer.ip in loc_cache:
-                    loc = loc_cache[peer.ip]
-                else:
-                    loc = geodb.get(peer.ip)
-                    loc_cache[peer.ip] = loc
-                if not loc or "location" not in loc:
-                    continue
-
-                # Create position array
-                lat, lon = (loc["location"]["latitude"], loc["location"]["longitude"])
-                latlon = "%s,%s" % (lat, lon)
-                if latlon in placed:  # Dont place more than 1 bar to same place, fake repos using ip address last two part
-                    lat += float(128 - int(peer.ip.split(".")[-2])) / 50
-                    lon += float(128 - int(peer.ip.split(".")[-1])) / 50
-                    latlon = "%s,%s" % (lat, lon)
-                placed[latlon] = True
-
-                globe_data += (lat, lon, ping)
-            # Append myself
-            loc = geodb.get(config.ip_external)
-            if loc:
-                lat, lon = (loc["location"]["latitude"], loc["location"]["longitude"])
-                globe_data += (lat, lon, -0.135)
+                globe_data += [peer_location["lat"], peer_location["lon"], height]
 
             self.response(to, globe_data)
         except Exception, err:
@@ -404,4 +711,49 @@ class UiWebsocketPlugin(object):
         permissions = self.getPermissions(to)
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
+
+        if self.site.address == config.updatesite:
+            return self.response(to, "You can't change the ownership of the updater site")
+
         self.site.settings["own"] = bool(owned)
+        self.site.updateWebsocket(owned=owned)
+
+    def actionUserSetSitePrivatekey(self, to, privatekey):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        site_data = self.user.sites[self.site.address]
+        site_data["privatekey"] = privatekey
+        self.site.updateWebsocket(set_privatekey=bool(privatekey))
+
+        return "ok"
+
+    def actionSiteSetAutodownloadoptional(self, to, owned):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.settings["autodownloadoptional"] = bool(owned)
+        self.site.bad_files = {}
+        gevent.spawn(self.site.update, check_files=True)
+        self.site.worker_manager.removeSolvedFileTasks()
+
+    def actionDbReload(self, to):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.storage.closeDb()
+        self.site.storage.getDb()
+
+        return self.response(to, "ok")
+
+    def actionDbRebuild(self, to):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.storage.rebuildDb()
+
+        return self.response(to, "ok")

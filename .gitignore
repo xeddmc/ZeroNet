@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 
 # Log files
-*.log
+**/*.log
 
 # Hidden files
 .*
@@ -13,3 +13,16 @@ __pycache__/
 
 # Data dir
 data/*
+*.db
+
+# Virtualenv
+env/*
+
+# Tor data
+tools/tor/data
+
+# PhantomJS, downloaded manually for unit tests
+tools/phantomjs
+
+# ZeroNet config file
+zeronet.conf

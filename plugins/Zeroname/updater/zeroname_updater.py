@@ -5,18 +5,17 @@ import sys
 import re
 import socket
 
+from subprocess import call
 from bitcoinrpc.authproxy import AuthServiceProxy
 
 
 def publish():
-    print "* Signing..."
-    os.system("python zeronet.py siteSign %s %s" % (config["site"], config["privatekey"]))
-    print "* Publishing..."
-    os.system("python zeronet.py sitePublish %s" % config["site"])
+    print "* Signing and Publishing..."
+    call(" ".join(command_sign_publish), shell=True)
 
 
-def processNameOp(domain, value):
-    if not value.startswith("{"):
+def processNameOp(domain, value, test=False):
+    if not value.strip().startswith("{"):
         return False
     try:
         data = json.loads(value)
@@ -32,6 +31,9 @@ def processNameOp(domain, value):
     if not re.match("^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$", domain):
         print "Invalid domain: ", domain
         return False
+
+    if test:
+        return True
 
     if "slave" in sys.argv:
         print "Waiting for master update arrive"
@@ -55,13 +57,14 @@ def processNameOp(domain, value):
     new_names_raw = json.dumps(names, indent=2, sort_keys=True)
     if new_names_raw != names_raw:
         open(names_path, "wb").write(new_names_raw)
+        print "-", domain, "Changed"
         return True
     else:
-        print "names not changed"
+        print "-", domain, "Not changed"
         return False
 
 
-def processBlock(block_id):
+def processBlock(block_id, test=False):
     print "Processing block #%s..." % block_id
     s = time.time()
     block_hash = rpc.getblockhash(block_id)
@@ -75,13 +78,41 @@ def processBlock(block_id):
             for vout in transaction.get("vout", []):
                 if "scriptPubKey" in vout and "nameOp" in vout["scriptPubKey"] and "name" in vout["scriptPubKey"]["nameOp"]:
                     name_op = vout["scriptPubKey"]["nameOp"]
-                    updated += processNameOp(name_op["name"].replace("d/", ""), name_op["value"])
+                    updated += processNameOp(name_op["name"].replace("d/", ""), name_op["value"], test)
         except Exception, err:
             print "Error processing tx #%s %s" % (tx, err)
     print "Done in %.3fs (updated %s)." % (time.time() - s, updated)
-    if updated:
-        publish()
+    return updated
 
+# Connecting to RPC
+def initRpc(config):
+    """Initialize Namecoin RPC"""
+    rpc_data = {
+        'connect': '127.0.0.1',
+        'port': '8336',
+        'user': 'PLACEHOLDER',
+        'password': 'PLACEHOLDER',
+        'clienttimeout': '900'
+    }
+    try:
+        fptr = open(config, 'r')
+        lines = fptr.readlines()
+        fptr.close()
+    except:
+        return None  # Or take some other appropriate action
+
+    for line in lines:
+        if not line.startswith('rpc'):
+            continue
+        key_val = line.split(None, 1)[0]
+        (key, val) = key_val.split('=', 1)
+        if not key or not val:
+            continue
+        rpc_data[key[3:]] = val
+
+    url = 'http://%(user)s:%(password)s@%(connect)s:%(port)s' % rpc_data
+
+    return url, int(rpc_data['clienttimeout'])
 
 # Loading config...
 
@@ -96,50 +127,64 @@ else:
 config_path = namecoin_location + 'zeroname_config.json'
 if not os.path.isfile(config_path):  # Create sample config
     open(config_path, "w").write(
-        json.dumps({'site': 'site', 'zeronet_path': '/home/zeronet/', 'privatekey': '', 'lastprocessed': 223911}, indent=2)
+        json.dumps({'site': 'site', 'zeronet_path': '/home/zeronet', 'privatekey': '', 'lastprocessed': 223910}, indent=2)
     )
-    print "Example config written to %s" % config_path
+    print "* Example config written to %s" % config_path
     sys.exit(0)
 
 config = json.load(open(config_path))
 names_path = "%s/data/%s/data/names.json" % (config["zeronet_path"], config["site"])
 os.chdir(config["zeronet_path"])  # Change working dir - tells script where Zeronet install is.
 
-# Getting rpc connect details
-namecoin_conf = open(namecoin_location + "namecoin.conf").read()
+# Parameters to sign and publish
+command_sign_publish = [sys.executable, "zeronet.py", "siteSign", config["site"], config["privatekey"], "--publish"]
+if sys.platform == 'win32':
+    command_sign_publish = ['"%s"' % param for param in command_sign_publish]
 
-# Connecting to RPC
-rpc_user = re.search("rpcuser=(.*)$", namecoin_conf, re.M).group(1)
-rpc_pass = re.search("rpcpassword=(.*)$", namecoin_conf, re.M).group(1)
-rpc_url = "http://%s:%s@127.0.0.1:8336" % (rpc_user, rpc_pass)
-
-rpc = AuthServiceProxy(rpc_url, timeout=60 * 5)
-
-last_block = int(rpc.getinfo()["blocks"])
-
-if not config["lastprocessed"]:  # Start processing from last block
-    config["lastprocessed"] = last_block
-
-# Processing skipped blocks
-print "Processing block from #%s to #%s..." % (config["lastprocessed"], last_block)
-for block_id in range(config["lastprocessed"], last_block + 1):
-    processBlock(block_id)
-
-# processBlock(223911) # Testing zeronetwork.bit
-# processBlock(227052) # Testing brainwallets.bit
-# processBlock(236824) # Utf8 domain name (invalid should skip)
-# processBlock(236752) # Uppercase domain (invalid should skip)
-# processBlock(236870) # Encoded domain (should pass)
-# sys.exit(0)
+# Initialize rpc connection
+rpc_auth, rpc_timeout = initRpc(namecoin_location + "namecoin.conf")
+rpc = AuthServiceProxy(rpc_auth, timeout=rpc_timeout)
 
 while 1:
-    print "Waiting for new block",
+    try:
+        time.sleep(1)
+        last_block = int(rpc.getinfo()["blocks"])
+        break # Connection succeeded
+    except socket.timeout:  # Timeout
+        print ".",
+        sys.stdout.flush()
+    except Exception, err:
+        print "Exception", err.__class__, err
+        time.sleep(5)
+        rpc = AuthServiceProxy(rpc_auth, timeout=rpc_timeout)
+
+if not config["lastprocessed"]:  # First startup: Start processing from last block
+    config["lastprocessed"] = last_block
+
+
+print "- Testing domain parsing..."
+assert processBlock(223911, test=True) # Testing zeronetwork.bit
+assert processBlock(227052, test=True) # Testing brainwallets.bit
+assert not processBlock(236824, test=True) # Utf8 domain name (invalid should skip)
+assert not processBlock(236752, test=True) # Uppercase domain (invalid should skip)
+assert processBlock(236870, test=True) # Encoded domain (should pass)
+# sys.exit(0)
+
+print "- Parsing skipped blocks..."
+should_publish = False
+for block_id in range(config["lastprocessed"], last_block + 1):
+    if processBlock(block_id):
+        should_publish = True
+config["lastprocessed"] = last_block
+
+if should_publish:
+    publish()
+
+while 1:
+    print "- Waiting for new block"
     sys.stdout.flush()
     while 1:
         try:
-            rpc = AuthServiceProxy(rpc_url, timeout=60 * 5)
-            if (int(rpc.getinfo()["blocks"]) > last_block):
-                break
             time.sleep(1)
             rpc.waitforblock()
             print "Found"
@@ -150,10 +195,16 @@ while 1:
         except Exception, err:
             print "Exception", err.__class__, err
             time.sleep(5)
+            rpc = AuthServiceProxy(rpc_auth, timeout=rpc_timeout)
 
     last_block = int(rpc.getinfo()["blocks"])
+    should_publish = False
     for block_id in range(config["lastprocessed"] + 1, last_block + 1):
-        processBlock(block_id)
+        if processBlock(block_id):
+            should_publish = True
 
     config["lastprocessed"] = last_block
-    open(config_path, "w").write(json.dumps(config, indent=1))
+    open(config_path, "w").write(json.dumps(config, indent=2))
+
+    if should_publish:
+        publish()
